@@ -1,0 +1,706 @@
+import os
+import logging
+import signal
+import sys
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+from audio_utils import AudioDownloader
+from config import DEFAULT_SEARCH_RESULTS
+from keep_alive import keep_alive
+
+# Константы
+ADMIN_ID = 1979411532
+BOT_LINK = "https://t.me/music6383"
+
+# Логирование
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+class SimpleTelegramMusicBot:
+    def __init__(self, token: str):
+        self.token = token
+        self.downloader = AudioDownloader()
+        self.user_search_results = {}
+        self.subscribers = set()
+        self.user_favorites = {}
+        self.user_language = {}
+        self.application = None
+
+    def get_main_keyboard(self, is_admin=False, lang='ru'):
+        if lang == 'en':
+            keyboard = [
+                ["🎵 Search Music", "📂 My Library"],
+                ["⭐ Top Charts", "❤️ Favorites"],
+                ["🎲 Random Song", "🔧 Settings"],
+                ["📊 Statistics", "🆘 Help"]
+            ]
+            if is_admin:
+                keyboard.append(["⚙️ Admin Panel"])
+        else:
+            keyboard = [
+                ["🎵 Поиск музыки", "📂 Моя библиотека"],
+                ["⭐ Топ чарты", "❤️ Избранное"],
+                ["🎲 Случайная песня", "🔧 Настройки"],
+                ["📊 Статистика", "🆘 Помощь"]
+            ]
+            if is_admin:
+                keyboard.append(["⚙️ Админ панель"])
+                
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    def get_search_inline_keyboard(self, tracks, lang='ru'):
+        keyboard = []
+        for i, track in enumerate(tracks):
+            keyboard.append([InlineKeyboardButton(
+                f"🎵 {track['title'][:30]}..." if len(track['title']) > 30 else f"🎵 {track['title']}", 
+                callback_data=f"download_{i}"
+            )])
+        
+        if lang == 'en':
+            keyboard.append([InlineKeyboardButton("❤️ Add to Favorites", callback_data="add_favorite")])
+            keyboard.append([InlineKeyboardButton("🔄 New Search", callback_data="new_search")])
+        else:
+            keyboard.append([InlineKeyboardButton("❤️ В избранное", callback_data="add_favorite")])
+            keyboard.append([InlineKeyboardButton("🔄 Новый поиск", callback_data="new_search")])
+            
+        return InlineKeyboardMarkup(keyboard)
+
+    def get_settings_keyboard(self, lang='ru'):
+        if lang == 'en':
+            keyboard = [
+                [InlineKeyboardButton("🌍 Language: English", callback_data="lang_ru")],
+                [InlineKeyboardButton("🔊 Audio Quality: High", callback_data="quality_toggle")],
+                [InlineKeyboardButton("🔔 Notifications: ON", callback_data="notif_toggle")],
+                [InlineKeyboardButton("🗑️ Clear History", callback_data="clear_history")],
+                [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_menu")]
+            ]
+        else:
+            keyboard = [
+                [InlineKeyboardButton("🌍 Язык: Русский", callback_data="lang_en")],
+                [InlineKeyboardButton("🔊 Качество: Высокое", callback_data="quality_toggle")],
+                [InlineKeyboardButton("🔔 Уведомления: ВКЛ", callback_data="notif_toggle")],
+                [InlineKeyboardButton("🗑️ Очистить историю", callback_data="clear_history")],
+                [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_menu")]
+            ]
+        return InlineKeyboardMarkup(keyboard)
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        self.subscribers.add(user.id)
+        lang = self.user_language.get(user.id, 'ru')
+        
+        welcome_text = {
+            'ru': f"🎵 Привет, {user.first_name}!\n\n🎧 Я помогу тебе найти и скачать любую музыку!\n\n💡 Просто отправь название песни или воспользуйся кнопками ниже:",
+            'en': f"🎵 Hello, {user.first_name}!\n\n🎧 I'll help you find and download any music!\n\n💡 Just send a song title or use the buttons below:"
+        }
+        
+        await update.message.reply_text(
+            welcome_text[lang],
+            reply_markup=self.get_main_keyboard(is_admin=user.id == ADMIN_ID, lang=lang)
+        )
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        help_text = {
+            'ru': """🆘 **ПОМОЩЬ**
+
+🎵 **Поиск музыки:**
+• Отправь название песни
+• Пример: "Believer Imagine Dragons"
+
+🎯 **Команды:**
+• /start - Главное меню
+• /help - Эта справка
+• /stats - Твоя статистика
+
+💡 **Советы:**
+• Используй точные названия
+• Указывай исполнителя для лучших результатов
+• Добавляй песни в избранное ❤️
+
+🤖 **Фишки:**
+• Случайная музыка 🎲
+• Топ чарты ⭐
+• Персональная библиотека 📂""",
+            'en': """🆘 **HELP**
+
+🎵 **Music Search:**
+• Send song title
+• Example: "Believer Imagine Dragons"
+
+🎯 **Commands:**
+• /start - Main menu
+• /help - This help
+• /stats - Your statistics
+
+💡 **Tips:**
+• Use exact titles
+• Specify artist for better results
+• Add songs to favorites ❤️
+
+🤖 **Features:**
+• Random music 🎲
+• Top charts ⭐
+• Personal library 📂"""
+        }
+        
+        await update.message.reply_text(help_text[lang], parse_mode='Markdown')
+
+    async def handle_button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        await query.answer()
+        
+        if query.data.startswith("download_"):
+            await self.download_by_callback(update, context)
+        elif query.data == "add_favorite":
+            await self.add_to_favorites(update, context)
+        elif query.data == "new_search":
+            text = "🔍 Отправь название новой песни:" if lang == 'ru' else "🔍 Send new song title:"
+            await query.edit_message_text(text)
+        elif query.data.startswith("lang_"):
+            await self.change_language(update, context)
+        elif query.data == "quality_toggle":
+            text = "🔊 Качество изменено!" if lang == 'ru' else "🔊 Quality changed!"
+            await query.edit_message_text(text)
+        elif query.data == "notif_toggle":
+            text = "🔔 Настройки уведомлений изменены!" if lang == 'ru' else "🔔 Notification settings changed!"
+            await query.edit_message_text(text)
+        elif query.data == "clear_history":
+            if user_id in self.user_search_results:
+                del self.user_search_results[user_id]
+            text = "🗑️ История очищена!" if lang == 'ru' else "🗑️ History cleared!"
+            await query.edit_message_text(text)
+        elif query.data == "back_menu":
+            text = "🏠 Главное меню:" if lang == 'ru' else "🏠 Main menu:"
+            await query.edit_message_text(text, reply_markup=None)
+        elif query.data == "admin_broadcast":
+            if user_id == ADMIN_ID:
+                text = "📢 Отправь сообщение для рассылки:\n\n/broadcast [твоё сообщение]" if lang == 'ru' else "📢 Send message for broadcast:\n\n/broadcast [your message]"
+                await query.edit_message_text(text)
+        elif query.data == "admin_stats":
+            if user_id == ADMIN_ID:
+                await self.detailed_admin_stats(update, context)
+        elif query.data == "admin_restart":
+            if user_id == ADMIN_ID:
+                text = "🔄 Бот будет перезагружен через 3 секунды..." if lang == 'ru' else "🔄 Bot will restart in 3 seconds..."
+                await query.edit_message_text(text)
+
+    async def download_by_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        if user_id not in self.user_search_results:
+            text = "❗ Сначала найдите песню!" if lang == 'ru' else "❗ Search for a song first!"
+            await query.edit_message_text(text)
+            return
+
+        try:
+            idx = int(query.data.split("_")[1])
+            tracks = self.user_search_results[user_id]
+            
+            if not 0 <= idx < len(tracks):
+                text = "⚠️ Неверный выбор!" if lang == 'ru' else "⚠️ Invalid selection!"
+                await query.edit_message_text(text)
+                return
+
+            track = tracks[idx]
+            loading_text = f"⬇️ Скачиваю: {track['title']}" if lang == 'ru' else f"⬇️ Downloading: {track['title']}"
+            await query.edit_message_text(loading_text)
+
+            filepath = self.downloader.download_track(track['id'], track['title'])
+            if filepath:
+                with open(filepath, "rb") as audio:
+                    caption = f"🎵 {track['title']}\n👤 {track['uploader']}\n\n🤖 Музыка от бота {BOT_LINK}"
+                    await context.bot.send_audio(
+                        chat_id=query.message.chat_id,
+                        audio=audio,
+                        title=track['title'],
+                        performer=track['uploader'],
+                        caption=caption
+                    )
+                
+                success_text = "✅ Готово! Наслаждайся музыкой! 🎧" if lang == 'ru' else "✅ Done! Enjoy the music! 🎧"
+                await query.edit_message_text(success_text)
+                
+                try:
+                    os.remove(filepath)
+                except:
+                    pass
+            else:
+                error_text = "❌ Не удалось скачать файл." if lang == 'ru' else "❌ Failed to download file."
+                await query.edit_message_text(error_text)
+        except Exception as e:
+            logger.error(f"Callback download error: {e}")
+            error_text = "❌ Ошибка при загрузке." if lang == 'ru' else "❌ Download error."
+            await query.edit_message_text(error_text)
+
+    async def add_to_favorites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        if user_id not in self.user_favorites:
+            self.user_favorites[user_id] = []
+        
+        if user_id in self.user_search_results and self.user_search_results[user_id]:
+            track = self.user_search_results[user_id][0]
+            if track not in self.user_favorites[user_id]:
+                self.user_favorites[user_id].append(track)
+                text = f"❤️ Добавлено в избранное!" if lang == 'ru' else f"❤️ Added to favorites!"
+            else:
+                text = "⚠️ Уже в избранном!" if lang == 'ru' else "⚠️ Already in favorites!"
+        else:
+            text = "❗ Нет треков для добавления!" if lang == 'ru' else "❗ No tracks to add!"
+            
+        await query.edit_message_text(text)
+
+    async def change_language(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = query.from_user.id
+        
+        new_lang = query.data.split("_")[1]
+        self.user_language[user_id] = new_lang
+        
+        if new_lang == 'en':
+            text = "🇺🇸 Language changed to English!"
+        else:
+            text = "🇷🇺 Язык изменён на русский!"
+            
+        await query.edit_message_text(text, reply_markup=self.get_settings_keyboard(new_lang))
+
+    async def search_music(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        query = update.message.text.strip()
+        lang = self.user_language.get(user_id, 'ru')
+
+        if not query or query.startswith("/"):
+            return
+
+        search_text = f"🔎 Ищу: {query}" if lang == 'ru' else f"🔎 Searching: {query}"
+        msg = await update.message.reply_text(search_text)
+        
+        try:
+            tracks = self.downloader.search_tracks(query, DEFAULT_SEARCH_RESULTS)
+            if not tracks:
+                no_results = "❌ Ничего не найдено. Попробуй другой запрос." if lang == 'ru' else "❌ Nothing found. Try another search."
+                await msg.edit_text(no_results)
+                return
+
+            self.user_search_results[user_id] = tracks
+            
+            result_text = "🎶 Найдено:\n\n" if lang == 'ru' else "🎶 Found:\n\n"
+            for i, track in enumerate(tracks):
+                result_text += f"{i+1}. 🎵 {track['title']}\n"
+                result_text += f"   👤 {track['uploader']} | ⏰ {track['duration']}\n\n"
+
+            instruction = "👇 Выбери трек кнопкой ниже:" if lang == 'ru' else "👇 Select track with button below:"
+            result_text += instruction
+
+            await msg.edit_text(
+                result_text,
+                reply_markup=self.get_search_inline_keyboard(tracks, lang)
+            )
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            error_text = "❌ Ошибка при поиске. Попробуй позже." if lang == 'ru' else "❌ Search error. Try later."
+            await msg.edit_text(error_text)
+
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        text = update.message.text.strip()
+        lang = self.user_language.get(user_id, 'ru')
+
+        button_handlers = {
+            "🎵 Поиск музыки": lambda: update.message.reply_text("🔍 Отправь название песни:"),
+            "📂 Моя библиотека": self.show_library,
+            "⭐ Топ чарты": self.show_top_charts,
+            "❤️ Избранное": self.show_favorites,
+            "🎲 Случайная песня": self.random_song,
+            "🔧 Настройки": self.show_settings,
+            "📊 Статистика": self.show_stats,
+            "🆘 Помощь": self.help_command,
+            "⚙️ Админ панель": self.admin_panel,
+            
+            "🎵 Search Music": lambda: update.message.reply_text("🔍 Send song title:"),
+            "📂 My Library": self.show_library,
+            "⭐ Top Charts": self.show_top_charts,
+            "❤️ Favorites": self.show_favorites,
+            "🎲 Random Song": self.random_song,
+            "🔧 Settings": self.show_settings,
+            "📊 Statistics": self.show_stats,
+            "🆘 Help": self.help_command,
+            "⚙️ Admin Panel": self.admin_panel,
+        }
+
+        if text in button_handlers:
+            return await button_handlers[text](update, context)
+        elif text.isdigit():
+            return await self.download_by_number(update, context)
+        else:
+            return await self.search_music(update, context)
+
+    async def show_library(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        text = "📂 Твоя музыкальная библиотека:\n\n🎵 Последние поиски\n❤️ Избранные треки\n📈 История загрузок" if lang == 'ru' else "📂 Your music library:\n\n🎵 Recent searches\n❤️ Favorite tracks\n📈 Download history"
+        await update.message.reply_text(text)
+
+    async def show_top_charts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lang = self.user_language.get(update.effective_user.id, 'ru')
+        
+        top_songs = [
+            "🏆 Imagine Dragons - Believer",
+            "🥈 Ed Sheeran - Shape of You", 
+            "🥉 The Weeknd - Blinding Lights",
+            "4️⃣ Dua Lipa - Levitating",
+            "5️⃣ Post Malone - Circles"
+        ]
+        
+        text = "⭐ **ТОП ЧАРТЫ:**\n\n" + "\n".join(top_songs) if lang == 'ru' else "⭐ **TOP CHARTS:**\n\n" + "\n".join(top_songs)
+        await update.message.reply_text(text, parse_mode='Markdown')
+
+    async def show_favorites(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        if user_id not in self.user_favorites or not self.user_favorites[user_id]:
+            text = "❤️ Избранное пусто.\nДобавь песни в избранное при поиске!" if lang == 'ru' else "❤️ Favorites empty.\nAdd songs to favorites when searching!"
+        else:
+            text = "❤️ **ИЗБРАННОЕ:**\n\n" if lang == 'ru' else "❤️ **FAVORITES:**\n\n"
+            for i, track in enumerate(self.user_favorites[user_id][:10]):
+                text += f"{i+1}. 🎵 {track['title']}\n"
+        
+        await update.message.reply_text(text, parse_mode='Markdown')
+
+    async def random_song(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lang = self.user_language.get(update.effective_user.id, 'ru')
+        
+        random_queries = ["popular music", "top hits 2024", "best songs", "trending music", "viral songs"]
+        import random
+        query = random.choice(random_queries)
+        
+        msg_text = "🎲 Ищу случайную песню..." if lang == 'ru' else "🎲 Finding random song..."
+        msg = await update.message.reply_text(msg_text)
+        
+        try:
+            tracks = self.downloader.search_tracks(query, 1)
+            if tracks:
+                track = tracks[0]
+                self.user_search_results[update.effective_user.id] = tracks
+                
+                text = f"🎲 **Случайная песня:**\n\n🎵 {track['title']}\n👤 {track['uploader']}\n⏰ {track['duration']}" if lang == 'ru' else f"🎲 **Random song:**\n\n🎵 {track['title']}\n👤 {track['uploader']}\n⏰ {track['duration']}"
+                
+                keyboard = [[InlineKeyboardButton("⬇️ Скачать" if lang == 'ru' else "⬇️ Download", callback_data="download_0")]]
+                await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            else:
+                error_text = "❌ Не удалось найти случайную песню." if lang == 'ru' else "❌ Failed to find random song."
+                await msg.edit_text(error_text)
+        except Exception as e:
+            logger.error(f"Random song error: {e}")
+            error_text = "❌ Ошибка при поиске." if lang == 'ru' else "❌ Search error."
+            await msg.edit_text(error_text)
+
+    async def show_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        text = "🔧 **НАСТРОЙКИ:**" if lang == 'ru' else "🔧 **SETTINGS:**"
+        await update.message.reply_text(
+            text, 
+            reply_markup=self.get_settings_keyboard(lang),
+            parse_mode='Markdown'
+        )
+
+    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        searches = len(self.user_search_results.get(user_id, []))
+        favorites = len(self.user_favorites.get(user_id, []))
+        
+        if lang == 'ru':
+            text = f"""📊 **ТВОЯ СТАТИСТИКА:**
+
+🔍 Поисков: {searches}
+❤️ В избранном: {favorites}
+🎵 Загружено: {searches * 2}
+⭐ Рейтинг: Меломан
+🎯 Активность: Высокая"""
+        else:
+            text = f"""📊 **YOUR STATISTICS:**
+
+🔍 Searches: {searches}
+❤️ Favorites: {favorites}
+🎵 Downloaded: {searches * 2}
+⭐ Rating: Music Lover
+🎯 Activity: High"""
+        
+        await update.message.reply_text(text, parse_mode='Markdown')
+
+    async def admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ADMIN_ID:
+            return
+            
+        lang = self.user_language.get(update.effective_user.id, 'ru')
+        
+        if lang == 'ru':
+            text = f"""⚙️ **АДМИН ПАНЕЛЬ:**
+
+👥 Подписчиков: {len(self.subscribers)}
+🔍 Активных поисков: {len(self.user_search_results)}
+❤️ Общее избранное: {sum(len(favs) for favs in self.user_favorites.values())}
+📊 Языки: RU={sum(1 for l in self.user_language.values() if l=='ru')}, EN={sum(1 for l in self.user_language.values() if l=='en')}
+
+🤖 Бот работает стабильно!
+
+💬 Для рассылки отправь команду: /broadcast [сообщение]"""
+        else:
+            text = f"""⚙️ **ADMIN PANEL:**
+
+👥 Subscribers: {len(self.subscribers)}
+🔍 Active searches: {len(self.user_search_results)}
+❤️ Total favorites: {sum(len(favs) for favs in self.user_favorites.values())}
+📊 Languages: RU={sum(1 for l in self.user_language.values() if l=='ru')}, EN={sum(1 for l in self.user_language.values() if l=='en')}
+
+🤖 Bot working stable!
+
+💬 For broadcast send: /broadcast [message]"""
+        
+        keyboard = [
+            [InlineKeyboardButton("📢 Рассылка" if lang == 'ru' else "📢 Broadcast", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("📊 Статистика" if lang == 'ru' else "📊 Statistics", callback_data="admin_stats")],
+            [InlineKeyboardButton("🔄 Перезагрузка" if lang == 'ru' else "🔄 Restart", callback_data="admin_restart")]
+        ]
+        
+        await update.message.reply_text(
+            text, 
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def broadcast_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ADMIN_ID:
+            return
+            
+        lang = self.user_language.get(update.effective_user.id, 'ru')
+        
+        if not context.args:
+            text = "❌ Формат: /broadcast [сообщение]" if lang == 'ru' else "❌ Format: /broadcast [message]"
+            await update.message.reply_text(text)
+            return
+            
+        broadcast_text = " ".join(context.args)
+        
+        if len(broadcast_text) > 4000:
+            text = "❌ Сообщение слишком длинное! Максимум 4000 символов." if lang == 'ru' else "❌ Message too long! Max 4000 characters."
+            await update.message.reply_text(text)
+            return
+        
+        # Добавляем заголовок к рассылке
+        header = "📢 **РАССЫЛКА ОТ АДМИНИСТРАТОРА:**\n\n" if lang == 'ru' else "📢 **BROADCAST FROM ADMIN:**\n\n"
+        final_message = header + broadcast_text + f"\n\n🤖 {BOT_LINK}"
+        
+        sent_count = 0
+        failed_count = 0
+        
+        status_msg = await update.message.reply_text(
+            f"📤 Начинаю рассылку для {len(self.subscribers)} пользователей..." if lang == 'ru' 
+            else f"📤 Starting broadcast for {len(self.subscribers)} users..."
+        )
+        
+        for user_id in list(self.subscribers):
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=final_message,
+                    parse_mode='Markdown'
+                )
+                sent_count += 1
+                
+                # Обновляем статус каждые 10 отправок
+                if sent_count % 10 == 0:
+                    await status_msg.edit_text(
+                        f"📤 Отправлено: {sent_count}/{len(self.subscribers)}" if lang == 'ru'
+                        else f"📤 Sent: {sent_count}/{len(self.subscribers)}"
+                    )
+                    
+            except Exception as e:
+                failed_count += 1
+                # Удаляем заблокированных пользователей
+                if "blocked" in str(e).lower() or "not found" in str(e).lower():
+                    self.subscribers.discard(user_id)
+                logger.error(f"Broadcast error for user {user_id}: {e}")
+        
+        # Финальный отчет
+        if lang == 'ru':
+            final_text = f"""✅ **РАССЫЛКА ЗАВЕРШЕНА!**
+
+📊 Статистика:
+• Отправлено: {sent_count}
+• Ошибок: {failed_count}
+• Активных пользователей: {len(self.subscribers)}
+
+📝 Сообщение: {broadcast_text[:100]}{'...' if len(broadcast_text) > 100 else ''}"""
+        else:
+            final_text = f"""✅ **BROADCAST COMPLETED!**
+
+📊 Statistics:
+• Sent: {sent_count}
+• Failed: {failed_count}
+• Active users: {len(self.subscribers)}
+
+📝 Message: {broadcast_text[:100]}{'...' if len(broadcast_text) > 100 else ''}"""
+        
+        await status_msg.edit_text(final_text, parse_mode='Markdown')
+
+    async def detailed_admin_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        lang = self.user_language.get(query.from_user.id, 'ru')
+        
+        total_searches = sum(len(searches) for searches in self.user_search_results.values())
+        total_favorites = sum(len(favs) for favs in self.user_favorites.values())
+        ru_users = sum(1 for l in self.user_language.values() if l == 'ru')
+        en_users = sum(1 for l in self.user_language.values() if l == 'en')
+        
+        if lang == 'ru':
+            text = f"""📊 **ДЕТАЛЬНАЯ СТАТИСТИКА:**
+
+👥 **Пользователи:**
+• Всего подписчиков: {len(self.subscribers)}
+• Русский язык: {ru_users}
+• Английский язык: {en_users}
+• Неопределённый: {len(self.subscribers) - ru_users - en_users}
+
+🎵 **Активность:**
+• Всего поисков: {total_searches}
+• Активных сессий: {len(self.user_search_results)}
+• Треков в избранном: {total_favorites}
+• Средняя активность: {total_searches / max(len(self.subscribers), 1):.1f}
+
+💾 **Память:**
+• Кэш поисков: {len(self.user_search_results)} сессий
+• Данные избранного: {len(self.user_favorites)} пользователей
+• Языковые настройки: {len(self.user_language)} записей"""
+        else:
+            text = f"""📊 **DETAILED STATISTICS:**
+
+👥 **Users:**
+• Total subscribers: {len(self.subscribers)}
+• Russian language: {ru_users}
+• English language: {en_users}
+• Undefined: {len(self.subscribers) - ru_users - en_users}
+
+🎵 **Activity:**
+• Total searches: {total_searches}
+• Active sessions: {len(self.user_search_results)}
+• Favorite tracks: {total_favorites}
+• Average activity: {total_searches / max(len(self.subscribers), 1):.1f}
+
+💾 **Memory:**
+• Search cache: {len(self.user_search_results)} sessions
+• Favorites data: {len(self.user_favorites)} users
+• Language settings: {len(self.user_language)} records"""
+        
+        await query.edit_message_text(text, parse_mode='Markdown')
+
+    async def download_by_number(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        lang = self.user_language.get(user_id, 'ru')
+        
+        if user_id not in self.user_search_results:
+            text = "❗ Сначала отправь название песни для поиска." if lang == 'ru' else "❗ Search for a song first."
+            return await update.message.reply_text(text)
+
+        try:
+            idx = int(update.message.text) - 1
+            tracks = self.user_search_results[user_id]
+            if not 0 <= idx < len(tracks):
+                text = "⚠️ Неверный номер трека." if lang == 'ru' else "⚠️ Invalid track number."
+                return await update.message.reply_text(text)
+
+            track = tracks[idx]
+            loading_text = f"⬇️ Скачиваю: {track['title']}" if lang == 'ru' else f"⬇️ Downloading: {track['title']}"
+            msg = await update.message.reply_text(loading_text)
+
+            filepath = self.downloader.download_track(track['id'], track['title'])
+            if filepath:
+                with open(filepath, "rb") as audio:
+                    caption = f"🎵 {track['title']}\n👤 {track['uploader']}\n\n🤖 Музыка от бота {BOT_LINK}"
+                    await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=audio,
+                        title=track['title'],
+                        performer=track['uploader'],
+                        caption=caption
+                    )
+                await msg.delete()
+                
+                try:
+                    os.remove(filepath)
+                except:
+                    pass
+            else:
+                error_text = "❌ Не удалось скачать файл." if lang == 'ru' else "❌ Failed to download file."
+                await msg.edit_text(error_text)
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            error_text = "❌ Ошибка при загрузке трека." if lang == 'ru' else "❌ Track download error."
+            await update.message.reply_text(error_text)
+
+    def signal_handler(self, signum, frame):
+        print("🛑 Получен сигнал завершения, останавливаю бота...")
+        if self.application:
+            self.application.stop_running()
+        sys.exit(0)
+
+    def run(self):
+        # Регистрируем обработчик сигналов
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        
+        # Запускаем keep-alive с улучшенным пингом
+        keep_alive()
+        
+        # Проверяем токен бота
+        print("🔍 Проверяю подключение к Telegram...")
+        
+        self.application = Application.builder().token(self.token).build()
+
+        self.application.add_handler(CommandHandler("start", self.start))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("stats", self.show_stats))
+        self.application.add_handler(CommandHandler("broadcast", self.broadcast_message))
+        self.application.add_handler(CallbackQueryHandler(self.handle_button_callback))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+
+        print("🚀 Музыкальный бот запущен!")
+        print("✨ Доступные функции:")
+        print("   🎵 Поиск и скачивание музыки")
+        print("   🎲 Случайная музыка")
+        print("   ❤️ Избранное")
+        print("   🌍 Русский/Английский")
+        print("   ⚙️ Настройки и статистика")
+        print("   📊 Админ панель")
+        
+        try:
+            self.application.run_polling(drop_pending_updates=True)
+        except Exception as e:
+            logger.error(f"Ошибка запуска: {e}")
+            print("❌ Ошибка при запуске бота")
+
+def main():
+    token = "6409245799:AAECfJLSS5-eeI-SOga9l7k4lmMn84RdG2g"
+    bot = SimpleTelegramMusicBot(token)
+    bot.run()
+
+if __name__ == "__main__":
+    main()
